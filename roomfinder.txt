@@ -1,0 +1,199 @@
+--@name RoomFinder
+--@author
+--@shared
+--@include ./publiclibs/safenet.txt
+local net = require("./publiclibs/safenet.txt")
+
+local chunkSize = 10
+local rendDist = 1500
+local rendDist2 = rendDist*rendDist
+    
+function writeVecAsInts(vec)
+    net.writeInt16(math.round(vec.x))
+    net.writeInt16(math.round(vec.y))
+    net.writeInt16(math.round(vec.z))
+end
+
+function readVecAsInts()
+    return Vector(net.readInt16(), net.readInt16(), net.readInt16())
+end
+
+if SERVER then
+
+local sendIndex = 1
+local navMeshData = {}
+local meshLoaded = false
+
+function mapArea(na)
+    local data = {
+        nw = na:getCorner(NAV_CORNER.NORTH_WEST),
+        ne = na:getCorner(NAV_CORNER.NORTH_EAST),
+        se = na:getCorner(NAV_CORNER.SOUTH_EAST),
+        sw = na:getCorner(NAV_CORNER.SOUTH_WEST),
+        mid = na:getCenter(),
+        id=na:getID(),
+        navArea = na
+    }
+    
+    table.insert(navMeshData, data)
+end
+
+local nmCount = navmesh.getNavAreaCount()
+print("have "..nmCount.." nav areas")
+
+local loadmesh = coroutine.wrap(function() 
+    for key, na in ipairs(navmesh.getAllNavAreas()) do
+        mapArea(na)
+        coroutine.yield()
+    end
+    return true
+end)
+
+        
+local toTransmit = {} 
+local playerHas = {}
+function allPlayersHas(id)
+    for k,p in ipairs(find.allPlayers()) do
+        if(playerHas[p:getName()] == nil or playerHas[p:getName()][id] == nil) then
+            return false
+        end
+        return false
+    end
+    
+    return true
+end
+
+function getToTransmitCoroutine()
+    toTransmit = {} 
+    sendIndex=1
+    return coroutine.wrap(function() 
+        for pkey, p in ipairs(find.allPlayers()) do
+            local curPos = p:getPos()
+            for key, na in ipairs(navMeshData) do
+                if ((na.mid - curPos):getLengthSqr() < rendDist2) then
+                    table.insert(toTransmit, na)
+                end
+            end
+            coroutine.yield()
+        end
+        return true
+    end)
+end
+
+local calculateToTransmit = getToTransmitCoroutine()
+
+
+
+hook.add("think","doStuff",function()
+    while quotaAverage()<quotaMax()*0.6 do
+        if not meshLoaded then
+            if loadmesh() then
+                print("done parsing navmesh")
+                meshLoaded = true
+                return
+            end
+        else
+            if calculateToTransmit() then
+                calculateToTransmit = getToTransmitCoroutine()
+            end
+        end
+    end
+end)
+
+
+
+timer.create("sendChunks",0,0, (function () 
+    if not net.isStreaming() and #toTransmit > 0 then
+        --print(#toTransmit)
+        local sentIds = {}
+        net.start("transmitNavChunk")
+            local lastSendIndex = math.min(sendIndex+chunkSize, #toTransmit)
+            net.writeUInt8(lastSendIndex-sendIndex)
+            for i = sendIndex, lastSendIndex do
+                local data = toTransmit[i]
+                net.writeUInt24(data.id)
+                writeVecAsInts(data.nw)
+                writeVecAsInts(data.ne)
+                writeVecAsInts(data.se)
+                writeVecAsInts(data.sw)
+                table.add(sentIds, data.id)
+            end
+        net.send()
+        sendIndex=sendIndex+chunkSize
+        if(sendIndex > #toTransmit) then
+            sendIndex=1
+        end
+        for k,p in ipairs(find.allPlayers()) do
+           if(playerHas[p:getName()] == nil) then
+                playerHas[p:getName()] = {}
+            end
+            for i,id in ipairs(sentIds) do
+                playerHas[p:getName()][id] = true
+            end
+        end
+    end
+end))
+
+elseif CLIENT then
+    local data = {}
+    local totalCount = 114923
+    local haveCount = 0
+    
+    if player() == owner() then
+        enableHud( owner(), true )
+    end
+    
+    net.receive("transmitNavChunk", function (len)
+        local size = net.readUInt8()
+        for i = 1, size+1 do
+            local navAreaId = net.readUInt24()
+            
+            data[navAreaId]={
+                nw=readVecAsInts(),
+                ne=readVecAsInts(),
+                se=readVecAsInts(),
+                sw=readVecAsInts(),
+                mid=Vector()
+            }
+            data[navAreaId].mid=(data[navAreaId].nw+data[navAreaId].se)/2
+        end
+    end) 
+    
+    local curPos = player():getPos()
+    
+    local toDraw = {}
+    
+    timer.create("posUpdateTime",0.1,0, (function () 
+        curPos = player():getPos()
+        toDraw = {}
+        haveCount = 0
+        for key, vecs in pairs(data) do
+            haveCount=haveCount+1
+            if((vecs.mid - curPos):getLengthSqr() < rendDist2) then
+                table.insert(toDraw, vecs)
+            end
+        end
+    end))
+    
+    hook.add( "postdrawtranslucentrenderables", "drawWorld", function()
+        if(quotaAverage()<quotaMax()*0.5) then
+            render.setRGBA(255,0,255,255)
+            render.draw3DLine(Vector(0,0,50),Vector(0,0,50))
+            for i = 1, #toDraw do
+                local vecs = toDraw[i]
+                render.draw3DQuad(vecs.sw,vecs.se,vecs.ne,vecs.nw)
+            end
+        else
+            rendDist2 = rendDist2*0.995
+        end
+    end, false, false)
+    
+
+    local font = render.createFont( "Verdana", 16, 800, true )
+    hook.add( "postdrawhud", "drawHud", function()
+        render.setColor( Color() )
+        render.setFont( font )
+        render.drawText( 20, 5, "Have "..haveCount.."/"..totalCount.." nav meshes downloaded" )
+    end, false, false)
+
+end
